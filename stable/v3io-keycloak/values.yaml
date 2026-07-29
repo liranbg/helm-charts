@@ -22,6 +22,28 @@ keycloak:
   postgresql:
     enabled: false
 
+  # A first-time install must run Keycloak's entire historical Liquibase changelog
+  # from scratch, which can take longer than livenessProbe's default 120s window on a
+  # loaded system - if that probe kills the container mid-migration, MySQL's
+  # non-transactional DDL leaves the schema permanently wedged (see IG-25046, and the
+  # heal-interrupted-migration init container below for the recovery half of this fix).
+  # A startupProbe defers liveness/readiness checks until Keycloak's HTTP port is
+  # actually up, so a slow first migration is never mistaken for a hung container.
+  startupProbe:
+    enabled: true
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60 # ~10 minutes for the first-time migration to complete
+    successThreshold: 1
+
+  # Per Bitnami's own guidance: once startupProbe is enabled, liveness/readiness
+  # should not add their own extra initial delay on top of it.
+  livenessProbe:
+    initialDelaySeconds: 0
+
+  readinessProbe:
+    initialDelaySeconds: 0
+
   externalDatabase:
     host: v3io-keycloak-db
     port: 3306
@@ -59,6 +81,82 @@ keycloak:
             echo "MySQL Server not available yet";
           done;
           echo -e "MySQL Server has started";
+    # Detects and recovers from a first-time Liquibase migration that was interrupted
+    # before it could complete (e.g. killed by the liveness probe): MySQL's DDL is not
+    # transactional, so an interrupted run leaves tables behind that DATABASECHANGELOG
+    # never recorded, and every subsequent boot then fails identically forever with a
+    # "duplicate key" / "already exists" error. See IG-25046.
+    #
+    # Only acts when DATABASECHANGELOG exists and is completely empty (Liquibase has
+    # never recorded a single successful changeset) AND every other table in the schema
+    # is also empty of data - the one state that can only be reached by an interrupted
+    # first migration, never by a real, working installation or an upgrade with
+    # existing data. If that signature doesn't match exactly, it leaves the database
+    # untouched and fails loudly instead of guessing.
+    - name: heal-interrupted-migration
+      image: {{ include "keycloak.image" . }}
+      imagePullPolicy: IfNotPresent
+      envFrom:
+        - secretRef:
+            name: {{ .Values.externalDatabase.existingSecret }}
+      env:
+        - name: DB_HOST
+          value: {{ .Values.externalDatabase.host | quote }}
+        - name: DB_PORT
+          value: {{ .Values.externalDatabase.port | quote }}
+        - name: DB_NAME
+          value: {{ .Values.externalDatabase.database | quote }}
+      command: ['bash', '-c']
+      args:
+        - |
+          set -eu
+
+          mysql_cmd() {
+            mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASSWORD" -N -B "$@"
+          }
+
+          changelog_exists=$(mysql_cmd -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='DATABASECHANGELOG';" "$DB_NAME")
+          if [ "$changelog_exists" = "0" ]; then
+            echo "[heal-interrupted-migration] No DATABASECHANGELOG table yet - genuinely fresh database. Nothing to do."
+            exit 0
+          fi
+
+          changelog_rows=$(mysql_cmd -e "SELECT COUNT(*) FROM DATABASECHANGELOG;" "$DB_NAME")
+          if [ "$changelog_rows" != "0" ]; then
+            echo "[heal-interrupted-migration] DATABASECHANGELOG has $changelog_rows applied changeset(s) - healthy database. Nothing to do."
+            exit 0
+          fi
+
+          echo "[heal-interrupted-migration] DATABASECHANGELOG exists but is empty - checking for a known interrupted-first-migration signature (IG-25046)..."
+
+          other_tables=$(mysql_cmd -e "SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name NOT IN ('DATABASECHANGELOG','DATABASECHANGELOGLOCK');" "$DB_NAME")
+
+          if [ -z "$other_tables" ]; then
+            echo "[heal-interrupted-migration] No other tables present - genuinely fresh database. Nothing to do."
+            exit 0
+          fi
+
+          total_rows=0
+          for t in $other_tables; do
+            c=$(mysql_cmd -e "SELECT COUNT(*) FROM \`$t\`;" "$DB_NAME")
+            total_rows=$((total_rows + c))
+          done
+
+          if [ "$total_rows" != "0" ]; then
+            echo "[heal-interrupted-migration] FATAL: DATABASECHANGELOG is empty but found $total_rows row(s) of data in pre-existing tables ($other_tables)."
+            echo "[heal-interrupted-migration] This does not match the known interrupted-first-migration signature, which always leaves those tables empty."
+            echo "[heal-interrupted-migration] Refusing to touch the database automatically - this needs manual investigation."
+            exit 1
+          fi
+
+          table_count=$(echo "$other_tables" | wc -w)
+          echo "[heal-interrupted-migration] Found $table_count leftover table(s) with no changelog entry, all empty of data: $other_tables"
+          echo "[heal-interrupted-migration] This matches a first-time migration that was interrupted before it could record its first changeset."
+          echo "[heal-interrupted-migration] Resetting schema '$DB_NAME' so Keycloak can perform a clean migration."
+
+          mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE \`$DB_NAME\`; CREATE DATABASE \`$DB_NAME\`;"
+
+          echo "[heal-interrupted-migration] Schema reset complete."
 
   # This is the content of the realms.json file in the v3io-keycloak-realms configmap.
   # The realms.json can contain a single json for a single realm or a list of jsons for multiple realms.
